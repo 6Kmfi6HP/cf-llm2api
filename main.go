@@ -413,6 +413,7 @@ func cloneUpstreamConfig(cfg *UpstreamConfig) *UpstreamConfig {
 	if cfg.CustomModels != nil {
 		cp.CustomModels = append([]string(nil), cfg.CustomModels...)
 	}
+	cp.CloudflareCredentials = cloneCloudflareCredentials(cfg.CloudflareCredentials)
 	return &cp
 }
 
@@ -436,7 +437,20 @@ func sameUpstreamConfig(a, b *UpstreamConfig) bool {
 		a.APIKey == b.APIKey &&
 		a.APIType == b.APIType &&
 		a.ResponsesReasoningFormat == b.ResponsesReasoningFormat &&
-		sameStringSlice(a.CustomModels, b.CustomModels)
+		sameStringSlice(a.CustomModels, b.CustomModels) &&
+		sameCloudflareCredentials(a.CloudflareCredentials, b.CloudflareCredentials)
+}
+
+func sameCloudflareCredentials(a, b []CloudflareCredential) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // upstreamsConfigChanged 判断上游连接相关配置是否变化（模型列表依赖这些字段）。
@@ -462,6 +476,26 @@ func normalizeSingleUpstream(cfg *UpstreamConfig) bool {
 	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
 	if cfg.APIType == "" {
 		cfg.APIType = UpstreamOpenAI
+	}
+	if cfg.APIType == UpstreamCloudflareWorkersAI && cfg.BaseURL == "" {
+		cfg.BaseURL = cloudflareDefaultBaseURL
+	}
+	if cfg.APIType == UpstreamCloudflareWorkersAI {
+		cfg.APIKey = ""
+		seen := map[string]struct{}{}
+		credentials := make([]CloudflareCredential, 0, len(cfg.CloudflareCredentials))
+		for _, raw := range cfg.CloudflareCredentials {
+			credential, ok := normalizeCloudflareCredential(raw)
+			if !ok {
+				continue
+			}
+			if _, exists := seen[credential.ID]; exists {
+				continue
+			}
+			seen[credential.ID] = struct{}{}
+			credentials = append(credentials, credential)
+		}
+		cfg.CloudflareCredentials = credentials
 	}
 	cfg.ResponsesReasoningFormat = strings.TrimSpace(cfg.ResponsesReasoningFormat)
 	if len(cfg.CustomModels) > 0 {
@@ -532,6 +566,9 @@ func fetchModelsFromUpstream(name string, cfg *UpstreamConfig) ([]ModelInfo, err
 			models = append(models, ModelInfo{ID: m, Object: "model", Created: now, OwnedBy: ownedBy})
 		}
 		return models, nil
+	}
+	if cfg.APIType == UpstreamCloudflareWorkersAI {
+		return fetchCloudflareModels(name, cfg)
 	}
 	endpoint := getUpstreamModelsEndpoint(cfg)
 	apiKeys := getUpstreamAPIKeys(cfg)
@@ -679,9 +716,11 @@ func getAliasModelInfos() []ModelInfo {
 // ======================== 配置 ========================
 
 var (
-	port       string
-	configPath = "config.json"
-	modelAlias = map[string]ModelAlias{}
+	port                 string
+	configPath           = "config.json"
+	cloudflareImportPath string
+	cloudflareVerify     bool
+	modelAlias           = map[string]ModelAlias{}
 
 	reasoningEffortMap = map[string]string{}
 	debugMode          bool
@@ -802,18 +841,19 @@ var (
 // ======================== 数据模型 ========================
 
 type OpenAIRequest struct {
-	Model           string         `json:"model"`
-	Messages        []Message      `json:"messages"`
-	Stream          bool           `json:"stream"`
-	Temperature     *float64       `json:"temperature,omitempty"`
-	MaxTokens       int            `json:"max_tokens,omitempty"`
-	TopP            *float64       `json:"top_p,omitempty"`
-	Thinking        any            `json:"thinking,omitempty"`
-	ReasoningEffort string         `json:"reasoning_effort,omitempty"`
-	ExtraBody       map[string]any `json:"extra_body,omitempty"`
-	StreamOptions   any            `json:"stream_options,omitempty"`
-	Tools           []Tool         `json:"tools,omitempty"`
-	ToolChoice      any            `json:"tool_choice,omitempty"`
+	Model               string         `json:"model"`
+	Messages            []Message      `json:"messages"`
+	Stream              bool           `json:"stream"`
+	Temperature         *float64       `json:"temperature,omitempty"`
+	MaxTokens           int            `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int            `json:"max_completion_tokens,omitempty"`
+	TopP                *float64       `json:"top_p,omitempty"`
+	Thinking            any            `json:"thinking,omitempty"`
+	ReasoningEffort     string         `json:"reasoning_effort,omitempty"`
+	ExtraBody           map[string]any `json:"extra_body,omitempty"`
+	StreamOptions       any            `json:"stream_options,omitempty"`
+	Tools               []Tool         `json:"tools,omitempty"`
+	ToolChoice          any            `json:"tool_choice,omitempty"`
 }
 
 type Message struct {
@@ -850,17 +890,19 @@ type ToolFunction struct {
 type UpstreamType string
 
 const (
-	UpstreamOpenAI    UpstreamType = "openai"
-	UpstreamAnthropic UpstreamType = "anthropic"
-	UpstreamResponses UpstreamType = "openai-responses"
+	UpstreamOpenAI              UpstreamType = "openai"
+	UpstreamAnthropic           UpstreamType = "anthropic"
+	UpstreamResponses           UpstreamType = "openai-responses"
+	UpstreamCloudflareWorkersAI UpstreamType = "cloudflare-workers-ai"
 )
 
 type UpstreamConfig struct {
-	BaseURL                  string       `json:"base_url"`
-	APIKey                   string       `json:"api_key"`
-	APIType                  UpstreamType `json:"api_type"`
-	CustomModels             []string     `json:"custom_models,omitempty"`
-	ResponsesReasoningFormat string       `json:"responses_reasoning_format,omitempty"`
+	BaseURL                  string                 `json:"base_url"`
+	APIKey                   string                 `json:"api_key"`
+	APIType                  UpstreamType           `json:"api_type"`
+	CustomModels             []string               `json:"custom_models,omitempty"`
+	ResponsesReasoningFormat string                 `json:"responses_reasoning_format,omitempty"`
+	CloudflareCredentials    []CloudflareCredential `json:"cloudflare_credentials,omitempty"`
 }
 
 // CPATranslatorConfig 控制是否用 CLIProxyAPI v7 sdk/translator 替代手写协议翻译（库式接入，灰度）。
@@ -1140,7 +1182,7 @@ func saveConfig(path string, cfg AppConfig) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0600)
 }
 
 func applyConfig(cfg AppConfig) bool {
@@ -1154,6 +1196,9 @@ func applyConfig(cfg AppConfig) bool {
 		reasoningEffortMap = cfg.ReasoningEffortMap
 	}
 	upstreamsChanged := upstreamsConfigChanged(upstreamCfgs, cfg.Upstreams)
+	if upstreamsChanged {
+		resetCloudflarePoolState()
+	}
 	upstreamCfgs = make(map[string]*UpstreamConfig, len(cfg.Upstreams))
 	for name, upstream := range cfg.Upstreams {
 		upstreamCfgs[name] = cloneUpstreamConfig(upstream)
@@ -2407,6 +2452,9 @@ func convertRequest(req *OpenAIRequest, alias ModelAlias) map[string]any {
 	if req.MaxTokens != 0 {
 		converted["max_tokens"] = req.MaxTokens
 	}
+	if req.MaxCompletionTokens != 0 {
+		converted["max_completion_tokens"] = req.MaxCompletionTokens
+	}
 	// Inject stream_options.include_usage for streaming requests.
 	if req.Stream {
 		streamOptions := map[string]any{"include_usage": true}
@@ -2933,6 +2981,8 @@ func getUpstreamEndpoint(upstream *UpstreamConfig) string {
 		return base + "/messages"
 	case UpstreamResponses:
 		return base + "/responses"
+	case UpstreamCloudflareWorkersAI:
+		return ""
 	default:
 		return base + "/chat/completions"
 	}
@@ -2979,6 +3029,9 @@ func prepareOpenAIUpstreamBody(reqBody []byte, modelID string, upstream *Upstrea
 func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string, rawResponse ...bool) ([]byte, int, http.Header, error) {
 	if upstream == nil || upstream.BaseURL == "" {
 		return nil, 500, nil, fmt.Errorf("upstream not configured")
+	}
+	if upstream.APIType == UpstreamCloudflareWorkersAI {
+		return callCloudflareNonStream(ctx, preparedBody, upstreamName, modelID, clientAPI, upstream, proxyAddr)
 	}
 
 	apiKey, apiKeyIndex, apiKeys := selectUpstreamAPIKey(upstreamName, upstream)
@@ -3095,6 +3148,9 @@ func callUpstream(ctx context.Context, reqBody []byte, upstreamName, modelID, cl
 func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string) (io.ReadCloser, int, http.Header, error) {
 	if upstream == nil || upstream.BaseURL == "" {
 		return nil, 500, nil, fmt.Errorf("upstream not configured")
+	}
+	if upstream.APIType == UpstreamCloudflareWorkersAI {
+		return callCloudflareStream(ctx, preparedBody, upstreamName, modelID, clientAPI, upstream, proxyAddr)
 	}
 
 	apiKey, apiKeyIndex, apiKeys := selectUpstreamAPIKey(upstreamName, upstream)
@@ -3853,9 +3909,14 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				if err == io.EOF {
 					break
 				}
-				log.Printf("Error reading stream: %v", err)
-				// 发送错误事件通知客户端
-				w.Write([]byte("data: {\"error\":\"stream read error\"}\n\n"))
+				if r.Context().Err() != nil {
+					log.Printf("[client disconnect] api=chat upstream=%s model=%s while reading stream", effectiveUpstreamName(upstreamName), req.Model)
+					return
+				}
+				log.Printf("[upstream stream read error] api=chat upstream=%s model=%s error=%v", effectiveUpstreamName(upstreamName), req.Model, err)
+				// OpenAI-compatible clients require error to be an object. The
+				// stream has already started, so fail in-band without replaying it.
+				w.Write([]byte("data: {\"error\":{\"message\":\"upstream stream read error\",\"type\":\"upstream_error\"}}\n\n"))
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
 				}
@@ -7150,6 +7211,11 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		for name, upstream := range upstreamCfgs {
 			cfg.Upstreams[name] = cloneUpstreamConfig(upstream)
+			if cfg.Upstreams[name].APIType == UpstreamCloudflareWorkersAI {
+				for i := range cfg.Upstreams[name].CloudflareCredentials {
+					cfg.Upstreams[name].CloudflareCredentials[i].APIToken = ""
+				}
+			}
 		}
 		configMu.RUnlock()
 		socks5Mu.RLock()
@@ -7169,6 +7235,29 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"Invalid JSON"}`, http.StatusBadRequest)
 			return
 		}
+		// Cloudflare tokens are write-only. An empty token for an existing stable
+		// credential ID means "keep the stored token".
+		configMu.RLock()
+		knownCloudflareCredentials := make([]CloudflareCredential, 0)
+		for _, previous := range upstreamCfgs {
+			if previous != nil && previous.APIType == UpstreamCloudflareWorkersAI {
+				knownCloudflareCredentials = append(knownCloudflareCredentials, previous.CloudflareCredentials...)
+			}
+		}
+		for name, incoming := range cfg.Upstreams {
+			if incoming == nil || incoming.APIType != UpstreamCloudflareWorkersAI {
+				continue
+			}
+			merged, err := mergeCloudflareCredentials(knownCloudflareCredentials, incoming.CloudflareCredentials)
+			if err != nil {
+				configMu.RUnlock()
+				http.Error(w, `{"error":"invalid Cloudflare credentials"}`, http.StatusBadRequest)
+				return
+			}
+			incoming.CloudflareCredentials = merged
+			cfg.Upstreams[name] = incoming
+		}
+		configMu.RUnlock()
 		normalizeConfig(&cfg)
 		if empty := emptyCustomModelUpstreams(cfg.Upstreams); len(empty) > 0 {
 			msg := "以下上游未配置模型，请点击\"获取模型列表\"或手动填写：" + strings.Join(empty, "、")
@@ -7583,8 +7672,8 @@ let aliasData={},effortData={},modelListByUpstream={},upstreamData={},socks5Data
 function toggleTheme(){const d=document.documentElement;const cur=d.getAttribute('data-theme');const next=cur==='dark'?null:'dark';if(next)d.setAttribute('data-theme',next);else d.removeAttribute('data-theme');localStorage.setItem('theme',next||'light');document.querySelector('.theme-toggle').textContent=next==='dark'?'🌙':'☀'}
 (function(){const t=localStorage.getItem('theme');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');document.addEventListener('DOMContentLoaded',()=>{const b=document.querySelector('.theme-toggle');if(b)b.textContent='🌙'})}})();
 function reloadConfig(){const sy=window.scrollY;fetch('/api/reload',{method:'POST'}).then(r=>r.json()).then(d=>{showToast('会话已刷新，模型 '+d.models+' 个','success')}).catch(()=>{}).finally(()=>{loadConfig();loadStats();setTimeout(()=>window.scrollTo(0,sy),100)})}
-function apiTypeSelectHtml(selected){const v=selected||'openai';return '<select data-field="api_type" onchange="onUpstreamTypeChange(this)"><option value="openai"'+(v==='openai'?' selected':'')+'>OpenAI</option><option value="anthropic"'+(v==='anthropic'?' selected':'')+'>Anthropic</option><option value="openai-responses"'+(v==='openai-responses'?' selected':'')+'>Responses</option></select>'}
-function upstreamTypeLabel(value){if(value==='anthropic')return 'Anthropic';if(value==='openai-responses')return 'Responses';return 'OpenAI'}
+function apiTypeSelectHtml(selected){const v=selected||'openai';return '<select data-field="api_type" onchange="onUpstreamTypeChange(this)"><option value="openai"'+(v==='openai'?' selected':'')+'>OpenAI</option><option value="anthropic"'+(v==='anthropic'?' selected':'')+'>Anthropic</option><option value="openai-responses"'+(v==='openai-responses'?' selected':'')+'>Responses</option><option value="cloudflare-workers-ai"'+(v==='cloudflare-workers-ai'?' selected':'')+'>Cloudflare Workers AI</option></select>'}
+function upstreamTypeLabel(value){if(value==='anthropic')return 'Anthropic';if(value==='openai-responses')return 'Responses';if(value==='cloudflare-workers-ai')return 'Cloudflare Workers AI';return 'OpenAI'}
 function nonEmptyLineCount(value){return String(value||'').split(/\r?\n/).map(s=>s.trim()).filter(Boolean).length}
 function customModelCount(value){return String(value||'').split(',').map(s=>s.trim()).filter(Boolean).length}
 function responsesReasoningFormatHtml(value){const legacy=['reasoning_effort','legacy','legacy_reasoning_effort'].includes(value);return '<select data-field="responses_reasoning_format"><option value=""'+(!legacy?' selected':'')+'>标准 reasoning.effort</option><option value="legacy_reasoning_effort"'+(legacy?' selected':'')+'>兼容 reasoning_effort</option></select>'}
@@ -7592,19 +7681,24 @@ function responsesReasoningFormatHtml(value){const legacy=['reasoning_effort','l
 function aliasReasoningFormatHtml(value){const v=(value==='thinking')?'thinking':'';return '<select data-field="reasoning_format" title="推理方言：默认透传 reasoning_effort；thinking 注入 thinking 对象"><option value=""'+(v===''?' selected':'')+'>默认 reasoning_effort</option><option value="thinking"'+(v==='thinking'?' selected':'')+'>thinking 对象</option></select>'}
 // aliasAcceptedEffortsDisplay：把后端 []string 或旧逗号串统一成显示用逗号串。
 function aliasAcceptedEffortsDisplay(value){if(Array.isArray(value))return value.map(s=>String(s).trim()).filter(Boolean).join(', ');if(typeof value==='string')return value.split(',').map(s=>s.trim()).filter(Boolean).join(', ');return ''}
-function upstreamCardHtml(name,up,expanded){up=up||{};const apiType=up.api_type||'openai';const baseURL=up.base_url||'';const apiKey=up.api_key||'';const customModels=(up.custom_models||[]).join(',');const keyCount=nonEmptyLineCount(apiKey);const modelCount=(up.custom_models||[]).length;let h='<details class="upstream-item" data-original-name="'+esc(name||'')+'"'+(expanded?' open':'')+'>';h+='<summary><span class="upstream-summary-name">'+esc(name||'未命名上游')+'</span><span class="upstream-type-badge">'+upstreamTypeLabel(apiType)+'</span><span class="upstream-summary-url">'+esc(baseURL||'尚未配置 Base URL')+'</span><span class="upstream-summary-meta">'+keyCount+' Key · '+modelCount+' 模型</span></summary>';h+='<div class="upstream-body"><div class="upstream-form-grid">';h+='<div class="upstream-field"><label>名称</label><input value="'+esc(name||'')+'" data-field="name" placeholder="例如: main" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field"><label>接口类型</label>'+apiTypeSelectHtml(apiType)+'</div>';h+='<div class="upstream-field full"><label>Base URL</label><input value="'+esc(baseURL)+'" data-field="base_url" placeholder="https://example.com/v1" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field full"><label>API Key（每行一个）</label><textarea data-field="api_key" placeholder="每行填写一个 API Key" oninput="updateUpstreamCardSummary(this)">'+esc(apiKey)+'</textarea><div class="field-hint">支持填写多个 Key，请求时按顺序轮询。</div></div>';h+='<div class="upstream-field full"><label>自定义模型</label><div class="custom-models-row"><input value="'+esc(customModels)+'" data-field="custom_models" placeholder="model-a, model-b" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"><button type="button" class="btn btn-secondary" onclick="fetchUpstreamModels(this)">获取模型列表</button></div><div class="field-hint">多个模型使用英文逗号分隔；点"获取模型列表"从上游 /models 实时拉取并填入；填入后启动/刷新不再自动拉取。</div></div>';h+='<div class="upstream-field full responses-format-field"'+(apiType==='openai-responses'?'':' style="display:none"')+'><label>Responses 推理参数格式</label>'+responsesReasoningFormatHtml(up.responses_reasoning_format||'')+'</div>';h+='</div><div class="upstream-item-actions"><button class="btn btn-danger" onclick="delUpstream(this)">删除此上游</button></div></div></details>';return h}
+function cfCredentialRows(credentials){return (credentials||[]).map(c=>'<tr data-cf-id="'+esc(c.id||'')+'"><td><input data-cf="account" value="'+esc(c.account_id||'')+'"></td><td><input data-cf="token" type="password" placeholder="留空保持不变"></td><td><input data-cf="enabled" type="checkbox"'+(c.enabled?' checked':'')+'></td><td data-cf="status">待验证</td><td><button type="button" class="btn btn-secondary" onclick="retryCFCredential(this)">重试</button> <button type="button" class="btn btn-danger" onclick="this.closest(\'tr\').remove()">删除</button></td></tr>').join('')}
+function upstreamCardHtml(name,up,expanded){up=up||{};const apiType=up.api_type||'openai';const baseURL=up.base_url||'';const apiKey=up.api_key||'';const customModels=(up.custom_models||[]).join(',');const credentials=up.cloudflare_credentials||[];const keyCount=apiType==='cloudflare-workers-ai'?credentials.length:nonEmptyLineCount(apiKey);const modelCount=(up.custom_models||[]).length;let h='<details class="upstream-item" data-original-name="'+esc(name||'')+'"'+(expanded?' open':'')+'>';h+='<summary><span class="upstream-summary-name">'+esc(name||'未命名上游')+'</span><span class="upstream-type-badge">'+upstreamTypeLabel(apiType)+'</span><span class="upstream-summary-url">'+esc(baseURL||'尚未配置 Base URL')+'</span><span class="upstream-summary-meta">'+keyCount+' 凭据 · '+modelCount+' 模型</span></summary>';h+='<div class="upstream-body"><div class="upstream-form-grid">';h+='<div class="upstream-field"><label>名称</label><input value="'+esc(name||'')+'" data-field="name" placeholder="例如: main" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field"><label>接口类型</label>'+apiTypeSelectHtml(apiType)+'</div>';h+='<div class="upstream-field full"><label>Base URL</label><input value="'+esc(baseURL)+'" data-field="base_url" placeholder="https://example.com/v1" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field full generic-key-field"'+(apiType==='cloudflare-workers-ai'?' style="display:none"':'')+'><label>API Key（每行一个）</label><textarea data-field="api_key" placeholder="每行填写一个 API Key" oninput="updateUpstreamCardSummary(this)">'+esc(apiKey)+'</textarea></div>';h+='<div class="upstream-field full cf-credentials-field"'+(apiType==='cloudflare-workers-ai'?'':' style="display:none"')+'><label>Cloudflare 凭据</label><table class="tbl"><thead><tr><th>Account ID</th><th>新 Token</th><th>启用</th><th>状态</th><th></th></tr></thead><tbody data-cf-rows>'+cfCredentialRows(credentials)+'</tbody></table><div class="actions"><button type="button" class="btn btn-primary" onclick="addCFCredential(this)">新增凭据</button><button type="button" class="btn btn-secondary" onclick="importCFCredentials(this)">批量导入四段格式</button></div></div>';h+='<div class="upstream-field full"><label>自定义模型</label><div class="custom-models-row"><input value="'+esc(customModels)+'" data-field="custom_models" placeholder="model-a, model-b" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"><button type="button" class="btn btn-secondary" onclick="fetchUpstreamModels(this)">获取模型列表</button></div></div>';h+='<div class="upstream-field full responses-format-field"'+(apiType==='openai-responses'?'':' style="display:none"')+'><label>Responses 推理参数格式</label>'+responsesReasoningFormatHtml(up.responses_reasoning_format||'')+'</div>';h+='</div><div class="upstream-item-actions"><button class="btn btn-danger" onclick="delUpstream(this)">删除此上游</button></div></div></details>';return h}
 function buildModelListByUpstreamFromCustomModels(){const grouped={};Object.keys(upstreamData).forEach(name=>{const arr=(upstreamData[name]&&Array.isArray(upstreamData[name].custom_models))?upstreamData[name].custom_models:(typeof (upstreamData[name]||{}).custom_models==='string'?(upstreamData[name].custom_models.split(',').map(s=>s.trim()).filter(Boolean)):[]);grouped[name]=Array.from(new Set(arr)).sort()});return grouped}
 function normalizeAliasData(){const next={};const fmtVal=v=>(v==='thinking')?'thinking':'';Object.keys(aliasData||{}).forEach(k=>{const raw=aliasData[k];if(typeof raw==='object'&&raw){next[k]={target_model:raw.target_model||'',upstream:raw.upstream||'',socks5_proxy:raw.socks5_proxy||'',with_reasoning:!!raw.with_reasoning,reasoning_format:fmtVal(raw.reasoning_format),accepted_efforts:aliasAcceptedEffortsDisplay(raw.accepted_efforts)}}else{next[k]={target_model:typeof raw==='string'?raw:'',upstream:'',socks5_proxy:'',with_reasoning:false,reasoning_format:'',accepted_efforts:''}}});aliasData=next}
 function normalizeUpstreamData(cfg){upstreamData=cfg.upstreams||{}}
 async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();aliasData=cfg.model_alias||{};normalizeAliasData();effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];normalizeUpstreamData(cfg);modelListByUpstream=buildModelListByUpstreamFromCustomModels()
-renderUpstreamTable();renderAliasTable();renderEffortTable();renderSocks5Table();setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
+renderUpstreamTable();renderAliasTable();renderEffortTable();renderSocks5Table();loadCFHealth();setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
 function renderUpstreamTable(){const list=document.getElementById('upstreamList');const names=Object.keys(upstreamData).sort();list.innerHTML=names.length?names.map(name=>upstreamCardHtml(name,upstreamData[name],false)).join(''):'<div class="upstream-empty">暂无上游配置，请先添加一个上游。</div>';}
 function addUpstreamRow(){collectUpstreams();const list=document.getElementById('upstreamList');const empty=list.querySelector('.upstream-empty');if(empty)empty.remove();list.insertAdjacentHTML('beforeend',upstreamCardHtml('',{api_type:'openai'},true));const cards=list.querySelectorAll('.upstream-item');const input=cards.length?cards[cards.length-1].querySelector('[data-field="name"]'):null;if(input)input.focus()}
 function delUpstream(btn){collectAliases();const card=btn.closest('.upstream-item');if(card)card.remove();collectUpstreams();modelListByUpstream=buildModelListByUpstreamFromCustomModels();const list=document.getElementById('upstreamList');if(!list.querySelector('.upstream-item'))list.innerHTML='<div class="upstream-empty">暂无上游配置，请先添加一个上游。</div>';renderAliasTable()}
-function collectUpstreams(){const r={};document.querySelectorAll('#upstreamList .upstream-item').forEach(card=>{const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';if(!name||!baseURL)return;const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value?.trim()||'';const reasoningFormat=(card.querySelector('[data-field="responses_reasoning_format"]')||{}).value||'';const up={base_url:baseURL,api_type:apiType};if(apiKey)up.api_key=apiKey;if(customRaw)up.custom_models=customRaw.split(',').map(s=>s.trim()).filter(Boolean);if(apiType==='openai-responses'&&reasoningFormat)up.responses_reasoning_format=reasoningFormat;r[name]=up;card.dataset.originalName=name});upstreamData=r;return r}
+function collectUpstreams(){const r={};document.querySelectorAll('#upstreamList .upstream-item').forEach(card=>{const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';if(!name||!baseURL)return;const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value?.trim()||'';const reasoningFormat=(card.querySelector('[data-field="responses_reasoning_format"]')||{}).value||'';const up={base_url:baseURL,api_type:apiType};if(apiKey&&apiType!=='cloudflare-workers-ai')up.api_key=apiKey;if(apiType==='cloudflare-workers-ai'){up.cloudflare_credentials=[...card.querySelectorAll('[data-cf-rows] tr')].map(tr=>({id:tr.dataset.cfId||'',account_id:(tr.querySelector('[data-cf="account"]')||{}).value?.trim()||'',api_token:(tr.querySelector('[data-cf="token"]')||{}).value?.trim()||'',enabled:!!(tr.querySelector('[data-cf="enabled"]')||{}).checked})).filter(c=>c.account_id)}if(customRaw)up.custom_models=customRaw.split(',').map(s=>s.trim()).filter(Boolean);if(apiType==='openai-responses'&&reasoningFormat)up.responses_reasoning_format=reasoningFormat;r[name]=up;card.dataset.originalName=name});upstreamData=r;return r}
 function updateUpstreamCardSummary(el){const card=el.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value||'';card.querySelector('.upstream-summary-name').textContent=name||'未命名上游';card.querySelector('.upstream-summary-url').textContent=baseURL||'尚未配置 Base URL';card.querySelector('.upstream-type-badge').textContent=upstreamTypeLabel(apiType);card.querySelector('.upstream-summary-meta').textContent=nonEmptyLineCount(apiKey)+' Key · '+customModelCount(customRaw)+' 模型'}
-function onUpstreamTypeChange(sel){const card=sel.closest('.upstream-item');const field=card?card.querySelector('.responses-format-field'):null;if(field)field.style.display=sel.value==='openai-responses'?'':'none';updateUpstreamCardSummary(sel)}
-function syncUpstreamOptions(){collectAliases();collectUpstreams();modelListByUpstream=buildModelListByUpstreamFromCustomModels();renderAliasTable()}function fetchUpstreamModels(btn){const card=btn.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';if(!baseURL){alert('请先填写 Base URL');return}const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const input=card.querySelector('[data-field="custom_models"]');const body={base_url:baseURL,api_type:apiType};if(apiKey)body.api_key=apiKey;const orig=btn.textContent;btn.disabled=true;btn.textContent='获取中…';fetch('/api/upstream/models?name='+encodeURIComponent(name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>{if(!r.ok){return r.text().then(t=>{throw new Error(t||('HTTP '+r.status))})}return r.json()}).then(d=>{const arr=Array.isArray(d.models)?d.models:[];if(arr.length===0){alert('上游未返回任何模型');return}input.value=arr.join(', ');updateUpstreamCardSummary(input);syncUpstreamOptions();btn.textContent='已填充 '+arr.length+' 个'}).catch(e=>{alert('获取失败: '+(e&&e.message?e.message:e))}).finally(()=>{btn.disabled=false;btn.textContent=orig})}
+function onUpstreamTypeChange(sel){const card=sel.closest('.upstream-item');if(!card)return;card.querySelector('.responses-format-field').style.display=sel.value==='openai-responses'?'':'none';card.querySelector('.generic-key-field').style.display=sel.value==='cloudflare-workers-ai'?'none':'';card.querySelector('.cf-credentials-field').style.display=sel.value==='cloudflare-workers-ai'?'':'none';if(sel.value==='cloudflare-workers-ai'&&!card.querySelector('[data-field="base_url"]').value.trim())card.querySelector('[data-field="base_url"]').value='https://api.cloudflare.com/client/v4';updateUpstreamCardSummary(sel)}
+function addCFCredential(btn){btn.closest('.cf-credentials-field').querySelector('[data-cf-rows]').insertAdjacentHTML('beforeend',cfCredentialRows([{id:'',account_id:'',enabled:true}]))}
+async function retryCFCredential(btn){const id=btn.closest('tr').dataset.cfId;if(!id)return;const r=await fetch('/api/cloudflare/credentials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});if(r.ok){showToast('已重置隔离状态','success');loadCFHealth()}}
+async function loadCFHealth(){try{const r=await fetch('/api/cloudflare/credentials');const d=await r.json();for(const card of document.querySelectorAll('.upstream-item')){const name=(card.querySelector('[data-field="name"]')||{}).value||'';const views=(d.upstreams||{})[name]||[];const byId=Object.fromEntries(views.map(v=>[v.id,v]));for(const tr of card.querySelectorAll('[data-cf-rows] tr')){const v=byId[tr.dataset.cfId];if(v){tr.querySelector('[data-cf="status"]').textContent=v.status+(v.last_error_code?' · '+v.last_error_code:'')+(v.token_suffix?' · '+v.token_suffix:'')}}}}catch(e){}}
+async function importCFCredentials(){const source=prompt('粘贴四段格式（邮箱、密码、Account ID、API Token）；邮箱和密码不会保存：');if(!source)return;const r=await fetch('/api/cloudflare/credentials/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source})});if(!r.ok){showToast('导入失败','error');return}const d=await r.json();showToast('已导入 '+d.added+' 组，共 '+d.total+' 组','success');loadConfig()}
+function syncUpstreamOptions(){collectAliases();collectUpstreams();modelListByUpstream=buildModelListByUpstreamFromCustomModels();renderAliasTable()}function fetchUpstreamModels(btn){const card=btn.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';if(!baseURL){alert('请先填写 Base URL');return}const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const input=card.querySelector('[data-field="custom_models"]');const body={base_url:baseURL,api_type:apiType};if(apiKey)body.api_key=apiKey;const orig=btn.textContent;btn.disabled=true;btn.textContent='获取中…';const options=apiType==='cloudflare-workers-ai'?{method:'GET'}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)};fetch('/api/upstream/models?name='+encodeURIComponent(name),options).then(r=>{if(!r.ok){return r.text().then(t=>{throw new Error(t||('HTTP '+r.status))})}return r.json()}).then(d=>{const arr=Array.isArray(d.models)?d.models:[];if(arr.length===0){alert('上游未返回任何模型');return}input.value=arr.join(', ');updateUpstreamCardSummary(input);syncUpstreamOptions();btn.textContent='已填充 '+arr.length+' 个'}).catch(e=>{alert('获取失败: '+(e&&e.message?e.message:e))}).finally(()=>{btn.disabled=false;btn.textContent=orig})}
 
 function modelsForUpstream(name){const resolved=(name||'').trim();return modelListByUpstream[resolved]||[]}
 function upstreamSelectHtml(selected){const names=Object.keys(upstreamData).sort();if(names.length===0)return '<select data-field="upstream" class="m-select" disabled><option value="">（未配置上游）</option></select>';let h='<select data-field="upstream" class="m-select" onchange="onAliasUpstreamChange(this)">';for(const name of names){h+='<option value="'+esc(name)+'"'+(selected===name?' selected':'')+'>'+esc(name)+'</option>'}h+='</select>';return h}
@@ -7648,8 +7742,61 @@ func main() {
 	flag.StringVar(&port, "port", "8000", "服务端口；纯端口(如 8000)监听所有网卡，含冒号(如 100.89.104.82:8000)则只监听该 IP")
 	flag.StringVar(&configPath, "config", "config.json", "配置文件路径")
 	flag.StringVar(&adminPassword, "password", "", "管理面板密码（留空则不启用登录验证）")
+	flag.StringVar(&cloudflareImportPath, "import-cloudflare-credentials", "", "从四段格式文件导入 Cloudflare 凭据后退出")
+	flag.BoolVar(&cloudflareVerify, "verify-cloudflare-credentials", false, "使用模型搜索逐一验证 Cloudflare 凭据后退出")
 	flag.BoolVar(&debugMode, "debug", false, "启用调试日志")
 	flag.Parse()
+	if cloudflareImportPath != "" {
+		data, err := os.ReadFile(cloudflareImportPath)
+		if err != nil {
+			log.Fatalf("Cloudflare 凭据文件读取失败: %v", err)
+		}
+		credentials, err := parseCloudflareCredentialSource(data)
+		if err != nil {
+			log.Fatalf("Cloudflare 凭据格式无效: %v", err)
+		}
+		cfg := loadConfig(configPath)
+		upstream := cfg.Upstreams["cloudflare-workers-ai"]
+		if upstream == nil {
+			upstream = &UpstreamConfig{BaseURL: cloudflareDefaultBaseURL, APIType: UpstreamCloudflareWorkersAI}
+			cfg.Upstreams["cloudflare-workers-ai"] = upstream
+		}
+		if upstream.APIType != UpstreamCloudflareWorkersAI {
+			log.Fatal("cloudflare-workers-ai 名称已被其他上游类型占用")
+		}
+		existing := map[string]struct{}{}
+		for _, c := range upstream.CloudflareCredentials {
+			existing[c.AccountID+"\x00"+c.APIToken] = struct{}{}
+		}
+		added := 0
+		for _, c := range credentials {
+			key := c.AccountID + "\x00" + c.APIToken
+			if _, ok := existing[key]; ok {
+				continue
+			}
+			existing[key] = struct{}{}
+			upstream.CloudflareCredentials = append(upstream.CloudflareCredentials, c)
+			added++
+		}
+		if err := saveConfig(configPath, cfg); err != nil {
+			log.Fatalf("Cloudflare 凭据保存失败: %v", err)
+		}
+		log.Printf("Cloudflare 凭据导入完成: parsed=%d added=%d total=%d", len(credentials), added, len(upstream.CloudflareCredentials))
+		return
+	}
+	if cloudflareVerify {
+		cfg := loadConfig(configPath)
+		upstream := cfg.Upstreams["cloudflare-workers-ai"]
+		if upstream == nil {
+			log.Fatal("未配置 cloudflare-workers-ai 上游")
+		}
+		report := verifyCloudflareCredentials(context.Background(), upstream)
+		log.Printf("Cloudflare 凭据验证完成: total=%d success=%d failed=%d statuses=%v codes=%v", report.Total, report.Success, report.Failed, report.Statuses, report.Codes)
+		if report.Failed > 0 {
+			os.Exit(1)
+		}
+		return
+	}
 
 	cfg := loadConfig(configPath)
 	applyConfig(cfg)
@@ -7683,6 +7830,8 @@ func main() {
 	http.HandleFunc("/api/stats", requireAuth(adminStatsHandler))
 	http.HandleFunc("/api/reload", requireAuth(reloadHandler))
 	http.HandleFunc("/api/upstream/models", requireAuth(upstreamModelsHandler))
+	http.HandleFunc("/api/cloudflare/credentials", requireAuth(cloudflareCredentialsHandler))
+	http.HandleFunc("/api/cloudflare/credentials/import", requireAuth(cloudflareCredentialImportHandler))
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))

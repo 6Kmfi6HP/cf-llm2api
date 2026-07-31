@@ -7,6 +7,7 @@
 - **多协议兼容**：同时暴露 OpenAI Chat Completions (`/v1/chat/completions`)、Anthropic Messages (`/v1/messages`)、OpenAI Responses (`/v1/responses`) 三个接口
 - **上游格式转换**：自动在上游协议与 OpenAI 协议之间双向转换，包括消息格式、工具调用 (tool use)、thinking / reasoning 字段、SSE 流式事件等
 - **多上游管理**：支持配置多个上游，按名称区分；每个上游支持多 API Key 轮询
+- **Cloudflare Workers AI 多账号**：将 `account_id` 与 API Token 作为不可拆分凭据轮换，支持按额度、鉴权、账号和模型资格错误隔离，并在 30 秒总预算内有界失败转移
 - **模型别名（严格）**：客户端只能使用 `model_alias` 里配置的别名；裸上游模型名一律返回 400。别名将请求模型名映射到上游实际模型，支持跨上游路由、独立代理出口和历史 `reasoning_content` 回传
 - **模型唯一来源 = custom_models**：每个上游的 `custom_models` 是模型唯一来源，完全由用户手工填写或点"获取模型列表"实时拉取后存入；启动/重载不再自动联网拉取上游 `/models`
 - **按模型代理出口**：保存 SOCKS5 代理配置，并可在每个模型映射中独立选择代理出口；默认直连
@@ -43,6 +44,8 @@ go run main.go -port 8080 -password mypass
 | `-config` | `config.json` | 配置文件路径 |
 | `-password` | `""` | 管理面板密码；**留空则不启用认证**（直接打开即用） |
 | `-debug` | `false` | 打印详细请求/响应日志 |
+| `-import-cloudflare-credentials` | `""` | 从四段格式文件导入凭据到固定上游并退出；仅保存 account/token |
+| `-verify-cloudflare-credentials` | `false` | 用模型搜索逐组验权并退出；不发起推理 |
 
 ## API 端点
 
@@ -66,6 +69,8 @@ go run main.go -port 8080 -password mypass
 | `/api/stats` | GET/DELETE | 查看 / 清空统计 |
 | `/api/reload` | POST | 热重载配置（从 config.json 重新读取并应用） |
 | `/api/upstream/models` | POST | 用临时配置或已保存配置实时拉取上游的模型列表 |
+| `/api/cloudflare/credentials` | GET/POST | 读取脱敏凭据健康状态 / 手动重置隔离状态 |
+| `/api/cloudflare/credentials/import` | POST | 批量导入四段格式凭据；仅返回数量 |
 
 ## 配置文件
 
@@ -119,10 +124,18 @@ go run main.go -port 8080 -password mypass
 - **`upstreams`** — 上游配置集合，每个键为上游名称
   - `base_url`：上游 API 根地址
   - `api_key`：API Key；每行一个，可配置多个，按轮询顺序分发
-  - `api_type`：`openai`、`anthropic` 或 `openai-responses`
+  - `api_type`：`openai`、`anthropic`、`openai-responses` 或 `cloudflare-workers-ai`
   - `custom_models`：**自定义模型列表，是模型唯一来源**；不依赖上游 `/models` 自动拉取，完全手工维护或点"获取模型列表"按钮自动填入
   - `responses_reasoning_format`：仅用于 Responses 上游；空值使用标准 `reasoning.effort`，`legacy_reasoning_effort` 使用兼容字段 `reasoning_effort`
 - **无 `default_upstream` 字段** — 已移除"默认上游"概念；别名的 `upstream` 必须显式指向某个上游（后端保存时会校验引用的上游/代理是否存在，孤儿引用返回 400）
+
+### Cloudflare Workers AI 多账号
+
+Cloudflare 上游默认使用 `https://api.cloudflare.com/client/v4`，凭据保存在独立的 `cloudflare_credentials` 数组中。每项包含稳定 `id`、`account_id`、写入后不再由管理 API 返回的 `api_token`，以及持久化的 `enabled` 开关。控制面板中 token 留空表示保持旧值；健康接口只返回 token 尾号、状态、错误码和恢复时间。
+
+推理统一发送到 `/accounts/{account_id}/ai/v1/chat/completions`。每次请求中同一凭据最多尝试一次：日额度错误 `3036` 冷却到下一个 UTC 零点；普通 429 遵守 `Retry-After`；鉴权、账号封禁和模型资格错误分别隔离到正确粒度。网络错误、408 和可重试 5xx 会切换凭据，客户端请求/模型错误直接返回。流式响应只在上游尚未成功返回时切换，一旦把 SSE body 交给下游便不再重放。
+
+模型按钮调用 Cloudflare `/accounts/{account_id}/ai/models/search` 并分页拉取文本生成模型。拉取只更新 `custom_models`，不会自动创建公开别名。
 
 ### API Key 多 Key 轮询
 
@@ -185,6 +198,7 @@ Token 统计记录 → 返回客户端
 - **Token 统计**：按模型显示请求数、输入/输出 token，含今日明细与累计总计，每 5 秒自动刷新
 - **上游配置**：可折叠卡片增删改上游；折叠摘要显示名称、协议、Base URL、Key 数和自定义模型数
 - **上游编辑**：展开卡片后分别编辑名称、接口类型、Base URL、多行 API Key 和自定义模型；"自定义模型"字段旁有"获取模型列表"按钮，点击后弹起抓取并自动填入；Responses 上游额外显示推理参数格式
+- **Cloudflare 凭据**：支持新增、替换 token、启停、删除、四段格式批量导入、脱敏健康状态和手动重试
 - **模型映射**：可视化配置别名路由、跨上游跳转、代理出口以及历史 `reasoning_content` 回传。上游列和模型列在下拉为空时显示 disabled 占位；非空时直接列选项、无空占位项，避免列表为空时的误操作
 - **SOCKS5 代理配置**：可视化管理代理条目，并在模型映射中选择对应出口；删除代理后引用显示"（已失效）"
 - **推理力度映射**：位于模型映射底部的折叠高级设置，自定义 effort 级别转换规则
@@ -196,6 +210,7 @@ Token 统计记录 → 返回客户端
 ```
 cf-llm2api/
 ├── main.go          # 项目唯一入口，包含所有业务逻辑和内嵌管理面板
+├── cloudflare_workers_ai.go # Cloudflare 凭据池、错误分类与模型搜索
 ├── config.json      # 运行时配置文件（本地生成，不提交）
 ├── stats.json       # Token 统计数据（自动生成，已 .gitignore）
 ├── .gitignore       # 忽略 *.exe / *.bak / stats.json
@@ -210,6 +225,7 @@ cf-llm2api/
 ## 注意事项
 
 - 默认 `api_type` 为 `openai`，如上游是 Anthropic 或 Responses API 请对应填写
+- `config.json` 始终以 `0600` 写入并由 `.gitignore` 排除；不要提交或复制其中的 Cloudflare token
 - 仅在上游要求或支持历史 `reasoning_content` 时启用 `with_reasoning`；不支持该字段的上游可能拒绝请求
 - Anthropic 直通模式下，系统消息中的 `x-anthropic-billing-header` 会被自动清洗
 - 流式请求会自动注入 `stream_options.include_usage: true` 以确保 token 统计准确
