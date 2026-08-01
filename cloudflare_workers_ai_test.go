@@ -495,3 +495,185 @@ func TestAdminConfigBlankCloudflareTokenKeepsStoredValue(t *testing.T) {
 		t.Fatalf("stored token was not preserved")
 	}
 }
+
+// 已保存凭据 id + 空 api_token（write-only）-> 必须从已保存配置回填 token 再拉取。
+func TestUpstreamModelsHandlerBackfillsWriteOnlyTokenFromSavedConfig(t *testing.T) {
+	const storedToken = "stored-write-only-token-00000000001"
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		if got := r.URL.Query().Get("task"); got != "Text Generation" {
+			http.Error(w, "unexpected task filter: "+got, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"success":true,"errors":[],"result":[`+
+			`{"name":"@cf/backfilled-model","task":{"id":"c329a1f9-323d-4e91-b2aa-582dd4188d34","name":"Text Generation"}}`+
+			`],"result_info":{"count":1,"page":1,"per_page":50,"total_count":1}}`)
+	}))
+	defer server.Close()
+
+	configMu.Lock()
+	oldUpstreams := upstreamCfgs
+	upstreamCfgs = map[string]*UpstreamConfig{"cf": {
+		BaseURL: server.URL,
+		APIType: UpstreamCloudflareWorkersAI,
+		CloudflareCredentials: []CloudflareCredential{
+			cfCredential("cf_x", "account-00000000000000000001", storedToken),
+		},
+	}}
+	configMu.Unlock()
+	t.Cleanup(func() { configMu.Lock(); upstreamCfgs = oldUpstreams; configMu.Unlock() })
+
+	// 已保存凭据 id + 空 api_token -> 必须从已保存配置回填 token 再拉取
+	body := fmt.Sprintf(`{"base_url":%q,"api_type":"cloudflare-workers-ai","cloudflare_credentials":[{"id":"cf_x","account_id":"account-00000000000000000001","api_token":"","enabled":true}]}`, server.URL)
+	req := httptest.NewRequest(http.MethodPost, "/api/upstream/models?name=cf", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	upstreamModelsHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if gotAuth != "Bearer "+storedToken {
+		t.Fatalf("upstream saw Authorization %q, want the stored token", gotAuth)
+	}
+	if !strings.Contains(rec.Body.String(), "@cf/backfilled-model") {
+		t.Fatalf("expected backfilled model in response: %s", rec.Body.String())
+	}
+}
+
+// CF 上游：空 custom_models 但带 1 个凭据 -> 允许保存（先存凭据、后拉模型）。
+func TestAdminConfigAcceptsCloudflareUpstreamWithEmptyModels(t *testing.T) {
+	configMu.Lock()
+	oldUpstreams, oldAliases, oldEfforts := upstreamCfgs, modelAlias, reasoningEffortMap
+	upstreamCfgs = map[string]*UpstreamConfig{}
+	modelAlias = map[string]ModelAlias{}
+	reasoningEffortMap = map[string]string{}
+	configMu.Unlock()
+	oldPath := configPath
+	configPath = filepath.Join(t.TempDir(), "config.json")
+	t.Cleanup(func() {
+		configMu.Lock()
+		upstreamCfgs, modelAlias, reasoningEffortMap = oldUpstreams, oldAliases, oldEfforts
+		configMu.Unlock()
+		configPath = oldPath
+	})
+	payload := `{"model_alias":{},"reasoning_effort_map":{},"upstreams":{"cf":{"base_url":"https://api.cloudflare.com/client/v4","api_type":"cloudflare-workers-ai","cloudflare_credentials":[{"id":"cf_a","account_id":"account-00000000000000000001","api_token":"fresh-token-000000000000000001","enabled":true}]}}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(payload))
+	rec := httptest.NewRecorder()
+	adminConfigHandler(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+}
+
+// CF 骨架：无凭据、无模型 -> 仍拒绝，避免存下完全空白的上游。
+func TestAdminConfigRejectsCredentiallessCloudflareUpstreamWithEmptyModels(t *testing.T) {
+	configMu.Lock()
+	oldUpstreams, oldAliases, oldEfforts := upstreamCfgs, modelAlias, reasoningEffortMap
+	upstreamCfgs = map[string]*UpstreamConfig{}
+	modelAlias = map[string]ModelAlias{}
+	reasoningEffortMap = map[string]string{}
+	configMu.Unlock()
+	oldPath := configPath
+	configPath = filepath.Join(t.TempDir(), "config.json")
+	t.Cleanup(func() {
+		configMu.Lock()
+		upstreamCfgs, modelAlias, reasoningEffortMap = oldUpstreams, oldAliases, oldEfforts
+		configMu.Unlock()
+		configPath = oldPath
+	})
+	payload := `{"model_alias":{},"reasoning_effort_map":{},"upstreams":{"cf":{"base_url":"https://api.cloudflare.com/client/v4","api_type":"cloudflare-workers-ai"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(payload))
+	rec := httptest.NewRecorder()
+	adminConfigHandler(rec, req)
+	if rec.Code != 400 {
+		t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+}
+
+// 非 CF 上游 + 空 custom_models -> 语义不变，仍拒绝。
+func TestAdminConfigStillRejectsNonCloudflareUpstreamWithEmptyModels(t *testing.T) {
+	configMu.Lock()
+	oldUpstreams, oldAliases, oldEfforts := upstreamCfgs, modelAlias, reasoningEffortMap
+	upstreamCfgs = map[string]*UpstreamConfig{}
+	modelAlias = map[string]ModelAlias{}
+	reasoningEffortMap = map[string]string{}
+	configMu.Unlock()
+	oldPath := configPath
+	configPath = filepath.Join(t.TempDir(), "config.json")
+	t.Cleanup(func() {
+		configMu.Lock()
+		upstreamCfgs, modelAlias, reasoningEffortMap = oldUpstreams, oldAliases, oldEfforts
+		configMu.Unlock()
+		configPath = oldPath
+	})
+	payload := `{"model_alias":{},"reasoning_effort_map":{},"upstreams":{"main":{"base_url":"https://example.com/v1","api_type":"openai"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(payload))
+	rec := httptest.NewRecorder()
+	adminConfigHandler(rec, req)
+	if rec.Code != 400 {
+		t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+}
+
+// GET 未知上游名仍 404（回退路径不变）。
+func TestUpstreamModelsHandlerUnknownSavedUpstreamStill404(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/upstream/models?name=does-not-exist", nil)
+	rec := httptest.NewRecorder()
+	upstreamModelsHandler(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s, want 404", rec.Code, rec.Body.String())
+	}
+}
+
+// 匿名凭据行（id 为空、token 在场）-> 派生稳定 id 后正常拉取，返回 200。
+func TestUpstreamModelsHandlerDerivesStableIDForAnonymousCredential(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"success":true,"errors":[],"result":[`+
+			`{"name":"@cf/anon-model","task":{"id":"c329a1f9-323d-4e91-b2aa-582dd4188d34","name":"Text Generation"}}`+
+			`],"result_info":{"count":1,"page":1,"per_page":50,"total_count":1}}`)
+	}))
+	defer server.Close()
+	body := fmt.Sprintf(`{"base_url":%q,"api_type":"cloudflare-workers-ai","cloudflare_credentials":[{"id":"","account_id":"account-00000000000000000001","api_token":"anon-token-0000000000000000001","enabled":true}]}`, server.URL)
+	req := httptest.NewRequest(http.MethodPost, "/api/upstream/models?name=preview", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	upstreamModelsHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "@cf/anon-model") {
+		t.Fatalf("expected anon-fetched model in response: %s", rec.Body.String())
+	}
+}
+
+// 死循环原始场景回归：新建 CF 上游（未保存），填 account+token 后直接点"获取模型列表"。
+// 前端现在应 POST 携带凭据 -> 后端临时 probe 拉取成功 -> 返回模型，而非 404 upstream not found。
+func TestDeadlockScenarioNewCFUpstreamFetchBeforeSave(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"success":true,"errors":[],"result":[`+
+			`{"name":"@cf/meta-llama-3.1-8b-instruct","task":{"id":"c329a1f9-323d-4e91-b2aa-582dd4188d34","name":"Text Generation"}}`+
+			`],"result_info":{"count":1,"page":1,"per_page":50,"total_count":1}}`)
+	}))
+	defer server.Close()
+
+	// 未保存任何上游（模拟全新用户）
+	configMu.Lock()
+	oldUpstreams := upstreamCfgs
+	upstreamCfgs = map[string]*UpstreamConfig{}
+	configMu.Unlock()
+	t.Cleanup(func() { configMu.Lock(); upstreamCfgs = oldUpstreams; configMu.Unlock() })
+
+	// 前端 fetchUpstreamModels 现在会发送的 body：始终 POST + CF 凭据行
+	body := fmt.Sprintf(`{"base_url":%q,"api_type":"cloudflare-workers-ai","cloudflare_credentials":[{"id":"","account_id":"account-00000000000000000001","api_token":"fresh-anon-token-0000000000001","enabled":true}]}`, server.URL)
+	req := httptest.NewRequest(http.MethodPost, "/api/upstream/models?name=cf-new", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	upstreamModelsHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DEADLOCK: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "@cf/meta-llama-3.1-8b-instruct") {
+		t.Fatalf("expected model in response: %s", rec.Body.String())
+	}
+}
