@@ -630,13 +630,19 @@ func fetchModelsFromUpstream(name string, cfg *UpstreamConfig) ([]ModelInfo, err
 }
 
 // emptyCustomModelUpstreams 返回 normalize 后 custom_models 仍为空的上游名（已按名排序）。
-// 仅统计 normalize 后保留下来的上游（有名字、有 BaseURL）；custom_models 是模型唯一来源，留空视为未配好。
+// 仅 CF 上游可在 custom_models 为空时保存（凭据已配、模型稍后点"获取模型列表"再填）；
+// 无凭据的 CF 骨架仍视为未配好，避免存下完全空白的上游。
 func emptyCustomModelUpstreams(m map[string]*UpstreamConfig) []string {
 	var empty []string
 	for _, name := range sortedUpstreamNames(m) {
-		if cfg := m[name]; cfg != nil && cfg.BaseURL != "" && len(cfg.CustomModels) == 0 {
-			empty = append(empty, name)
+		cfg := m[name]
+		if cfg == nil || cfg.BaseURL == "" || len(cfg.CustomModels) > 0 {
+			continue
 		}
+		if cfg.APIType == UpstreamCloudflareWorkersAI && len(cfg.CloudflareCredentials) > 0 {
+			continue // CF: 允许先存凭据、后拉模型
+		}
+		empty = append(empty, name)
 	}
 	return empty
 }
@@ -7153,6 +7159,26 @@ func upstreamModelsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing base_url", http.StatusBadRequest)
 		return
 	}
+	// Cloudflare tokens 是 write-only：已保存的凭据行表单里 api_token 留空。
+	// 按凭据 id 从已保存配置回填 token（镜像 adminConfigHandler 的合并逻辑）；
+	// 匿名新行则由 normalizeCloudflareCredential 由 account+token 派生稳定 id，
+	// 使拉取与保存两处的池状态 key 保持一致。
+	if probe.APIType == UpstreamCloudflareWorkersAI && len(probe.CloudflareCredentials) > 0 {
+		configMu.RLock()
+		known := make([]CloudflareCredential, 0)
+		for _, prev := range upstreamCfgs {
+			if prev != nil && prev.APIType == UpstreamCloudflareWorkersAI {
+				known = append(known, prev.CloudflareCredentials...)
+			}
+		}
+		configMu.RUnlock()
+		merged, err := mergeCloudflareCredentials(known, probe.CloudflareCredentials)
+		if err != nil {
+			http.Error(w, "invalid Cloudflare credentials: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		probe.CloudflareCredentials = merged
+	}
 	if name == "" {
 		name = "preview"
 	}
@@ -7692,13 +7718,13 @@ function renderUpstreamTable(){const list=document.getElementById('upstreamList'
 function addUpstreamRow(){collectUpstreams();const list=document.getElementById('upstreamList');const empty=list.querySelector('.upstream-empty');if(empty)empty.remove();list.insertAdjacentHTML('beforeend',upstreamCardHtml('',{api_type:'openai'},true));const cards=list.querySelectorAll('.upstream-item');const input=cards.length?cards[cards.length-1].querySelector('[data-field="name"]'):null;if(input)input.focus()}
 function delUpstream(btn){collectAliases();const card=btn.closest('.upstream-item');if(card)card.remove();collectUpstreams();modelListByUpstream=buildModelListByUpstreamFromCustomModels();const list=document.getElementById('upstreamList');if(!list.querySelector('.upstream-item'))list.innerHTML='<div class="upstream-empty">暂无上游配置，请先添加一个上游。</div>';renderAliasTable()}
 function collectUpstreams(){const r={};document.querySelectorAll('#upstreamList .upstream-item').forEach(card=>{const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';if(!name||!baseURL)return;const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value?.trim()||'';const reasoningFormat=(card.querySelector('[data-field="responses_reasoning_format"]')||{}).value||'';const up={base_url:baseURL,api_type:apiType};if(apiKey&&apiType!=='cloudflare-workers-ai')up.api_key=apiKey;if(apiType==='cloudflare-workers-ai'){up.cloudflare_credentials=[...card.querySelectorAll('[data-cf-rows] tr')].map(tr=>({id:tr.dataset.cfId||'',account_id:(tr.querySelector('[data-cf="account"]')||{}).value?.trim()||'',api_token:(tr.querySelector('[data-cf="token"]')||{}).value?.trim()||'',enabled:!!(tr.querySelector('[data-cf="enabled"]')||{}).checked})).filter(c=>c.account_id)}if(customRaw)up.custom_models=customRaw.split(',').map(s=>s.trim()).filter(Boolean);if(apiType==='openai-responses'&&reasoningFormat)up.responses_reasoning_format=reasoningFormat;r[name]=up;card.dataset.originalName=name});upstreamData=r;return r}
-function updateUpstreamCardSummary(el){const card=el.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value||'';card.querySelector('.upstream-summary-name').textContent=name||'未命名上游';card.querySelector('.upstream-summary-url').textContent=baseURL||'尚未配置 Base URL';card.querySelector('.upstream-type-badge').textContent=upstreamTypeLabel(apiType);card.querySelector('.upstream-summary-meta').textContent=nonEmptyLineCount(apiKey)+' Key · '+customModelCount(customRaw)+' 模型'}
+function updateUpstreamCardSummary(el){const card=el.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value||'';const credCount=apiType==='cloudflare-workers-ai'?card.querySelectorAll('[data-cf-rows] tr').length:nonEmptyLineCount(apiKey);card.querySelector('.upstream-summary-name').textContent=name||'未命名上游';card.querySelector('.upstream-summary-url').textContent=baseURL||'尚未配置 Base URL';card.querySelector('.upstream-type-badge').textContent=upstreamTypeLabel(apiType);card.querySelector('.upstream-summary-meta').textContent=credCount+' 凭据 · '+customModelCount(customRaw)+' 模型'}
 function onUpstreamTypeChange(sel){const card=sel.closest('.upstream-item');if(!card)return;card.querySelector('.responses-format-field').style.display=sel.value==='openai-responses'?'':'none';card.querySelector('.generic-key-field').style.display=sel.value==='cloudflare-workers-ai'?'none':'';card.querySelector('.cf-credentials-field').style.display=sel.value==='cloudflare-workers-ai'?'':'none';if(sel.value==='cloudflare-workers-ai'&&!card.querySelector('[data-field="base_url"]').value.trim())card.querySelector('[data-field="base_url"]').value='https://api.cloudflare.com/client/v4';updateUpstreamCardSummary(sel)}
 function addCFCredential(btn){btn.closest('.cf-credentials-field').querySelector('[data-cf-rows]').insertAdjacentHTML('beforeend',cfCredentialRows([{id:'',account_id:'',enabled:true}]))}
 async function retryCFCredential(btn){const id=btn.closest('tr').dataset.cfId;if(!id)return;const r=await fetch('/api/cloudflare/credentials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});if(r.ok){showToast('已重置隔离状态','success');loadCFHealth()}}
 async function loadCFHealth(){try{const r=await fetch('/api/cloudflare/credentials');const d=await r.json();for(const card of document.querySelectorAll('.upstream-item')){const name=(card.querySelector('[data-field="name"]')||{}).value||'';const views=(d.upstreams||{})[name]||[];const byId=Object.fromEntries(views.map(v=>[v.id,v]));for(const tr of card.querySelectorAll('[data-cf-rows] tr')){const v=byId[tr.dataset.cfId];if(v){tr.querySelector('[data-cf="status"]').textContent=v.status+(v.last_error_code?' · '+v.last_error_code:'')+(v.token_suffix?' · '+v.token_suffix:'')}}}}catch(e){}}
 async function importCFCredentials(){const source=prompt('粘贴四段格式（邮箱、密码、Account ID、API Token）；邮箱和密码不会保存：');if(!source)return;const r=await fetch('/api/cloudflare/credentials/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source})});if(!r.ok){showToast('导入失败','error');return}const d=await r.json();showToast('已导入 '+d.added+' 组，共 '+d.total+' 组','success');loadConfig()}
-function syncUpstreamOptions(){collectAliases();collectUpstreams();modelListByUpstream=buildModelListByUpstreamFromCustomModels();renderAliasTable()}function fetchUpstreamModels(btn){const card=btn.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';if(!baseURL){alert('请先填写 Base URL');return}const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const input=card.querySelector('[data-field="custom_models"]');const body={base_url:baseURL,api_type:apiType};if(apiKey)body.api_key=apiKey;const orig=btn.textContent;btn.disabled=true;btn.textContent='获取中…';const options=apiType==='cloudflare-workers-ai'?{method:'GET'}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)};fetch('/api/upstream/models?name='+encodeURIComponent(name),options).then(r=>{if(!r.ok){return r.text().then(t=>{throw new Error(t||('HTTP '+r.status))})}return r.json()}).then(d=>{const arr=Array.isArray(d.models)?d.models:[];if(arr.length===0){alert('上游未返回任何模型');return}input.value=arr.join(', ');updateUpstreamCardSummary(input);syncUpstreamOptions();btn.textContent='已填充 '+arr.length+' 个'}).catch(e=>{alert('获取失败: '+(e&&e.message?e.message:e))}).finally(()=>{btn.disabled=false;btn.textContent=orig})}
+function syncUpstreamOptions(){collectAliases();collectUpstreams();modelListByUpstream=buildModelListByUpstreamFromCustomModels();renderAliasTable()}function fetchUpstreamModels(btn){const card=btn.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';if(!baseURL){alert('请先填写 Base URL');return}const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const input=card.querySelector('[data-field="custom_models"]');const body={base_url:baseURL,api_type:apiType};if(apiKey&&apiType!=='cloudflare-workers-ai')body.api_key=apiKey;if(apiType==='cloudflare-workers-ai')body.cloudflare_credentials=[...card.querySelectorAll('[data-cf-rows] tr')].map(tr=>({id:tr.dataset.cfId||'',account_id:(tr.querySelector('[data-cf="account"]')||{}).value?.trim()||'',api_token:(tr.querySelector('[data-cf="token"]')||{}).value?.trim()||'',enabled:!!(tr.querySelector('[data-cf="enabled"]')||{}).checked})).filter(c=>c.account_id);const orig=btn.textContent;btn.disabled=true;btn.textContent='获取中…';fetch('/api/upstream/models?name='+encodeURIComponent(name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>{if(!r.ok){return r.text().then(t=>{throw new Error(t||('HTTP '+r.status))})}return r.json()}).then(d=>{const arr=Array.isArray(d.models)?d.models:[];if(arr.length===0){alert('上游未返回任何模型');return}input.value=arr.join(', ');updateUpstreamCardSummary(input);syncUpstreamOptions();btn.textContent='已填充 '+arr.length+' 个'}).catch(e=>{alert('获取失败: '+(e&&e.message?e.message:e))}).finally(()=>{btn.disabled=false;btn.textContent=orig})}
 
 function modelsForUpstream(name){const resolved=(name||'').trim();return modelListByUpstream[resolved]||[]}
 function upstreamSelectHtml(selected){const names=Object.keys(upstreamData).sort();if(names.length===0)return '<select data-field="upstream" class="m-select" disabled><option value="">（未配置上游）</option></select>';let h='<select data-field="upstream" class="m-select" onchange="onAliasUpstreamChange(this)">';for(const name of names){h+='<option value="'+esc(name)+'"'+(selected===name?' selected':'')+'>'+esc(name)+'</option>'}h+='</select>';return h}
